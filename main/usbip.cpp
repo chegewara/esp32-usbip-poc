@@ -143,9 +143,9 @@ static void _event_handler(void* event_handler_arg, esp_event_base_t event_base,
         resp.request.status = 0;
         strcpy(resp.path, "/espressif/usbip/usb1");
         strcpy(resp.busid, "1-1");
-        resp.busnum = 1;
-        resp.devnum = 1;
-        resp.count = 1;
+        resp.busnum = __bswap_32(1);
+        resp.devnum = __bswap_32(1);
+        resp.count = __bswap_32(1);
         dev->fill_list_data(&resp);
 
         int to_write = 12;
@@ -162,8 +162,8 @@ static void _event_handler(void* event_handler_arg, esp_event_base_t event_base,
         resp.request.status = 0;
         strcpy(resp.path, "/espressif/usbip/usb1");
         strcpy(resp.busid, "1-1");
-        resp.busnum = 1;
-        resp.devnum = 1;
+        resp.busnum = __bswap_32(1);
+        resp.devnum = __bswap_32(1);
         dev->fill_import_data(&resp);
 
         int to_write = sizeof(usbip_import_t);

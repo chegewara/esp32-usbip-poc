@@ -2,7 +2,7 @@
 This is proof of concept of USBIP in esp32 S2/S3 SoC.
 
 ## Start usbip driver
-After installing `usbip` in linux, we need to modeprobe module.
+After installing `usbip` on linux, we need to modeprobe module.
 `sudo modprobe vhci-hcd`
 
 ## Linux commands

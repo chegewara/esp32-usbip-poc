@@ -36,21 +36,34 @@ static const char *TAG = "example";
 static EventGroupHandle_t wifi_event_grp;
 
 uint8_t rx_buffer[4*1024];
-static void do_retransmit(const int sock)
+void close_socket(int sock)
 {
+        shutdown(sock, 0);
+        close(sock);
+}
+
+static void do_retransmit(void* p)
+{
+    const int sock = (int)p;
     int len;
     do {
-        len = recv(sock, rx_buffer, sizeof(rx_buffer), 0);
-        if (len < 0) {
+        len = recv(sock, rx_buffer, sizeof(rx_buffer), MSG_DONTWAIT);
+        if (len < 0 && errno == EWOULDBLOCK) {
+            vTaskDelay(1);
+            continue;
+        } else if (len < 0) {
             ESP_LOGE(TAG, "Error occurred during receiving: errno %d", errno);
+            break;
         } else if (len == 0) {
             ESP_LOGW(TAG, "Connection closed");
+            break;
         } else {
-            // printf("request\n");
-            // ESP_LOG_BUFFER_HEX_LEVEL(TAG, rx_buffer, len, ESP_LOG_ERROR);
             parse_request(sock, rx_buffer, len);
         }
-    } while (len > 0);
+    } while (1);
+
+    close_socket(sock);
+    vTaskDelete(NULL);
 }
 
 static void tcp_server_task(void *pvParameters)
@@ -139,10 +152,7 @@ static void tcp_server_task(void *pvParameters)
 #endif
         ESP_LOGI(TAG, "Socket accepted ip address: %s", addr_str);
 
-        do_retransmit(sock);
-
-        shutdown(sock, 0);
-        close(sock);
+        xTaskCreatePinnedToCore(do_retransmit, "tcp_tx", 1 * 4096, (void*)sock, 21, NULL, 1);
     }
 
 CLEAN_UP:
@@ -152,7 +162,6 @@ CLEAN_UP:
 #define WIFI_CONNECTED_BIT BIT0
 
 void esp_event_handler(void* event_handler_arg, esp_event_base_t event_base, int32_t event_id, void* event_data)
-// static esp_err_t esp32_event_handler(void *ctx, system_event_t *event)
 {
     switch(event_id) 
     {
@@ -219,7 +228,7 @@ esp_err_t wifi_init()
 
     esp_netif_t *esp_netif = NULL;
     esp_netif = esp_netif_next(esp_netif);
-    esp_netif_set_hostname(esp_netif, "esp32s2");
+    esp_netif_set_hostname(esp_netif, "espressif-usbipd");
 
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
     ESP_ERROR_CHECK(esp_wifi_init(&cfg));

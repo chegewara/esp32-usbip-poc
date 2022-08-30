@@ -23,6 +23,7 @@ extern "C" void start_server();
 USBhost* host;
 static USBipDevice* device;
 static bool is_ready = false;
+static USBIP usbip;
 
 void client_event_callback(const usb_host_client_event_msg_t *event_msg, void *arg)
 {
@@ -46,7 +47,6 @@ void client_event_callback(const usb_host_client_event_msg_t *event_msg, void *a
         is_ready = false;
         device->deinit();
         delete(device);
-
     }
 }
 
@@ -62,7 +62,7 @@ extern "C" void app_main(void)
     esp_log_level_set("*", ESP_LOG_ERROR);
     esp_log_level_set("*", ESP_LOG_NONE);
     // esp_log_level_set("USB_EPx_RESP", ESP_LOG_NONE);
-    esp_log_level_set("example", ESP_LOG_INFO);
+    // esp_log_level_set("example", ESP_LOG_INFO);
     init_usbip();
 
     start_server();

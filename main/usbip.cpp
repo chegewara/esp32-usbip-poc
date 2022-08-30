@@ -3,10 +3,35 @@
 #include <string.h>
 #include "esp_log.h"
 #include "esp_event.h"
+#include "byteswap.h"
+#include "lwip/err.h"
+#include "lwip/sockets.h"
+#include "lwip/sys.h"
+#include <lwip/netdb.h>
 
 #include "usbip.hpp"
 
-#define TAG "usbip"
+// commands
+#define OP_REQ_DEVLIST bswap_constant_16(0x8005)
+#define OP_REP_DEVLIST bswap_constant_16(0x0005)
+#define OP_REQ_IMPORT bswap_constant_16(0x8003)
+#define OP_REP_IMPORT bswap_constant_16(0x0003)
+
+// usbip_header_basic commands
+#define USBIP_CMD_SUBMIT bswap_constant_16(0x01)
+#define USBIP_RET_SUBMIT bswap_constant_32(0x03)
+#define USBIP_CMD_UNLINK bswap_constant_16(0x02)
+#define USBIP_RET_UNLINK bswap_constant_32(0x04)
+
+#define USBIP_VERSION   bswap_constant_16(0x0111)   // v1.11
+#define USB_LOW_SPEED   bswap_constant_32(1)
+#define USB_FULL_SPEED  bswap_constant_32(2)
+
+static usbip_import_t import_data = {};
+static usbip_devlist_t devlist_data = {};
+static uint32_t last_seqnum = 0;
+static uint32_t last_unlink = 0;
+
 usb_device_info_t info;
 const usb_device_desc_t *dev_desc;
 static esp_event_loop_handle_t loop_handle;
@@ -18,39 +43,45 @@ static bool is_ready = false;
 static bool finished = false;
 static usb_transfer_t *_transfer;
 
-ESP_EVENT_DEFINE_BASE(USBIP_EVENT_BASE);
 #define USB_CTRL_RESP   0x1001
 #define USB_EPx_RESP    0x1002
 
+ESP_EVENT_DECLARE_BASE( USBIP_EVENT_BASE );
+ESP_EVENT_DEFINE_BASE(USBIP_EVENT_BASE);
+
+#define TAG "usbip"
+#include <algorithm>
+#include <vector>
+static std::vector<uint32_t> vec;
+
 static void usb_ctrl_cb(usb_transfer_t *transfer)
 {
-    // ESP_LOG_BUFFER_HEX("TAG 0", transfer->data_buffer, transfer->actual_num_bytes);
-    // finished = true;
-    size_t len1 = transfer->actual_num_bytes;
-    // esp_rom_printf("actual num bytes 0: %d\n", len1);
-    esp_event_post_to(loop_handle, USBIP_EVENT_BASE, USB_CTRL_RESP, (void*)&transfer, sizeof(usb_transfer_t*), 0);
-    // xSemaphoreGive(usb_sem1);
+    esp_event_post_to(loop_handle, USBIP_EVENT_BASE, USB_CTRL_RESP, (void*)&transfer, sizeof(usb_transfer_t*), 10);
 }
 
 static void usb_read_cb(usb_transfer_t *transfer)
 {
-    ESP_LOG_BUFFER_HEX("usb_read_cb", transfer->data_buffer, transfer->actual_num_bytes);
-
-    size_t len1 = transfer->actual_num_bytes;
-    // esp_rom_printf("actual num bytes 1: %d\n", len1);
-    esp_event_post_to(loop_handle, USBIP_EVENT_BASE, USB_EPx_RESP, (void*)&transfer, sizeof(usb_transfer_t*), 0);
-    // xSemaphoreGive(usb_sem1);
+    esp_event_post_to(loop_handle, USBIP_EVENT_BASE, USB_EPx_RESP, (void*)&transfer, sizeof(usb_transfer_t*), 10);
 }
 
 static void _event_handler(void* event_handler_arg, esp_event_base_t event_base, int32_t event_id, void* event_data)
 {
-    // printf("%s: 0x%04x\n\n\n\n\n\n\n\n", event_base, event_id);
     switch (event_id)
     {
     case USB_CTRL_RESP:{
         USBipDevice* dev = (USBipDevice*)event_handler_arg;
         usb_transfer_t *transfer = *(usb_transfer_t **)event_data;
         usbip_submit_t* req = (usbip_submit_t*)transfer->context;
+        uint32_t seqnum = __bswap_32(req->header.seqnum);
+        if (std::find(vec.begin(), vec.end(), seqnum) != vec.end())
+        {
+            delete req;
+            dev->deallocate(transfer);
+            break;
+        }
+        vec.insert(vec.begin(), seqnum);
+        if(vec.size() >= 999) vec.pop_back();
+
         int _len = transfer->actual_num_bytes - 8; //__bswap_32(req->length);
         if(_len < 0) {
             dev->deallocate(transfer);   
@@ -61,12 +92,9 @@ static void _event_handler(void* event_handler_arg, esp_event_base_t event_base,
             _len = 0;
         }
 
-        req->header.command = __bswap_32(USBIP_RET_SUBMIT);
-        // for server (response), this shall be set to 0
+        req->header.command = USBIP_RET_SUBMIT;
         req->header.devid = 0;
-        // only used by client, for server this shall be 0
         req->header.direction = 0;
-        // ep: endpoint number only used by client, for server this shall be 0
         req->header.ep = 0;
         req->status = 0;
         // TODO: transfer_buffer. If direction is USBIP_DIR_IN then n equals actual_length; 
@@ -84,17 +112,26 @@ static void _event_handler(void* event_handler_arg, esp_event_base_t event_base,
         }
         int to_write = 0x30 + _len;
         ESP_LOG_BUFFER_HEX_LEVEL("USB_CTRL_RESP", (void*)req, to_write, ESP_LOG_WARN);
-        int written = write(_sock, (void*)req, to_write);
+        send(_sock, (void*)req, to_write, MSG_DONTWAIT);
         delete req;
         dev->deallocate(transfer);
         break;
     }
 
     case USB_EPx_RESP:{
-        ESP_LOGE("", "here");
         USBipDevice* dev = (USBipDevice*)event_handler_arg;
         usb_transfer_t *transfer = *(usb_transfer_t **)event_data;
         usbip_submit_t* req = (usbip_submit_t*)transfer->context;
+        uint32_t seqnum = __bswap_32(req->header.seqnum);
+        if (std::find(vec.begin(), vec.end(), seqnum) != vec.end())
+        {
+            delete req;
+            dev->deallocate(transfer);
+            break;
+        }
+        vec.insert(vec.begin(), seqnum);
+        if(vec.size() >= 999) vec.pop_back();
+
         int _len = transfer->actual_num_bytes;
         if(_len <= 0) {
             dev->deallocate(transfer);   
@@ -105,12 +142,9 @@ static void _event_handler(void* event_handler_arg, esp_event_base_t event_base,
             _len = 0;
         }
 
-        req->header.command = __bswap_32(USBIP_RET_SUBMIT);
-        // for server (response), this shall be set to 0
+        req->header.command = USBIP_RET_SUBMIT;
         req->header.devid = 0;
-        // only used by client, for server this shall be 0
         req->header.direction = 0;
-        // ep: endpoint number only used by client, for server this shall be 0
         req->header.ep = 0;
         req->status = 0;
         // TODO: transfer_buffer. If direction is USBIP_DIR_IN then n equals actual_length; 
@@ -129,57 +163,31 @@ static void _event_handler(void* event_handler_arg, esp_event_base_t event_base,
         int to_write = 0x30 + _len;
         ESP_LOG_BUFFER_HEX_LEVEL("USB_EPx_RESP", (void*)req, to_write, ESP_LOG_WARN);
 
-        int written = write(_sock, (void*)req, to_write);
+        send(_sock, (void*)req, to_write, MSG_DONTWAIT);
         delete req;
         dev->deallocate(transfer);
         break;
     }
 
-    case OP_REQ_DEVLIST:{
-        USBipDevice* dev = (USBipDevice*)event_handler_arg;
-        usbip_devlist_t resp = {};
-        resp.request.version = USBIP_VERSION;
-        resp.request.command = __bswap_16(OP_REP_DEVLIST);
-        resp.request.status = 0;
-        strcpy(resp.path, "/espressif/usbip/usb1");
-        strcpy(resp.busid, "1-1");
-        resp.busnum = __bswap_32(1);
-        resp.devnum = __bswap_32(1);
-        resp.count = __bswap_32(1);
-        dev->fill_list_data(&resp);
-
-        int to_write = 12;
-        if(resp.count > 0) to_write = resp.count * (0x0c + 0x138 + resp.bNumInterfaces * 4);
-        int written = write(_sock, (void*)&resp, to_write);
+    default:
         break;
     }
+}
 
-    case OP_REQ_IMPORT:{
-        USBipDevice* dev = (USBipDevice*)event_handler_arg;
-        usbip_import_t resp = {};
-        resp.request.version = USBIP_VERSION;
-        resp.request.command = __bswap_16(OP_REP_IMPORT);
-        resp.request.status = 0;
-        strcpy(resp.path, "/espressif/usbip/usb1");
-        strcpy(resp.busid, "1-1");
-        resp.busnum = __bswap_32(1);
-        resp.devnum = __bswap_32(1);
-        dev->fill_import_data(&resp);
-
-        int to_write = sizeof(usbip_import_t);
-        int written = write(_sock, (void*)&resp, to_write);
-        break;
-    }
-
+static void _event_handler1(void* event_handler_arg, esp_event_base_t event_base, int32_t event_id, void* event_data)
+{
+    switch (event_id)
+    {
     case USBIP_CMD_SUBMIT:{
-        xSemaphoreTake(usb_sem, 10000);
         USBipDevice* dev = (USBipDevice*)event_handler_arg;
         urb_data_t* data = (urb_data_t*)event_data;
+        int socket = data->socket;
         uint8_t* rx_buffer = (uint8_t*) data->rx_buffer;
         int len = data->len;
         int start = 0;
         int _len = len;
-        ESP_LOG_BUFFER_HEX_LEVEL("SUBMIT 1", rx_buffer, 48, ESP_LOG_WARN);
+        usbip_submit_t* __req = (usbip_submit_t*)(rx_buffer);
+        uint32_t seqnum = __bswap_32(__req->header.seqnum);
 
         do
         {
@@ -187,52 +195,45 @@ static void _event_handler(void* event_handler_arg, esp_event_base_t event_base,
             ESP_LOG_BUFFER_HEX("SUBMIT", rx_buffer + start, 48);
 
             usbip_submit_t* _req = (usbip_submit_t*)(rx_buffer + start);
-            usbip_submit_t* req = new usbip_submit_t(); // make it heap caps malloc
+            usbip_submit_t* req = new usbip_submit_t();
             int tl = 0;
-            if(_req->header.direction == 0)
-                tl = __bswap_32(_req->length);
+            if(_req->header.direction == 0) tl = __bswap_32(_req->length);
+
             memcpy(req, _req, 0x30 + tl);
             
             ESP_LOGW(TAG, "request ep: %d", __bswap_32(req->header.ep));
             int tlen = 0;
 
-            if(req->header.ep == 0){ // EP0
+            if(req->header.ep == 0) // EP0
+            {
                 tlen = dev->req_ctrl_xfer(req);
                 if(tlen > 0){
                     ESP_LOG_BUFFER_HEX_LEVEL("SUBMIT 7", rx_buffer + start, 48 + tlen, ESP_LOG_ERROR);
-                // printf("\ttlen 1: %d\n\n", tlen);
                 }
                 tlen = 0;
             } else { // EPx
                 tlen = dev->req_ep_xfer(req);
                 if(tlen > 0){
                     ESP_LOG_BUFFER_HEX_LEVEL("SUBMIT 10", rx_buffer + start, 48 + tlen, ESP_LOG_ERROR);
-                // printf("\ttlen 2: %d/%d/%d\n\n", tlen, _len, len);
                 }
             }
             start += 0x30 + tlen;
             _len -= 0x30 + tlen;
             ESP_LOGI(TAG, "USBIP_CMD_SUBMIT: end 0x%02x, len: %d", start, _len);
         } 
-        // while(0);
         while (_len >= 0x30);
-        xSemaphoreGive(usb_sem);
-        // printf("done\n");
         break;
     }
 
     case USBIP_CMD_UNLINK:{
         usbip_unlink_t* req = *(usbip_unlink_t**)event_data;
-        req->header.command = __bswap_32(USBIP_RET_UNLINK);
-        // for server (response), this shall be set to 0
+        req->header.command = USBIP_RET_UNLINK;
         req->header.devid = 0;
-        // only used by client, for server this shall be 0
         req->header.direction = 0;
-        // ep: endpoint number only used by client, for UNLINK, this shall be 0
         req->header.ep = 0;
         req->status = 0;
         int to_write = 48;
-        int written = write(_sock, (void*)req, to_write);
+        send(_sock, (void*)req, to_write, MSG_DONTWAIT);
         ESP_LOG_BUFFER_HEX(TAG, (void*)req, 48);
         delete req;
         break;
@@ -243,30 +244,54 @@ static void _event_handler(void* event_handler_arg, esp_event_base_t event_base,
     }
 }
 
+static void _event_handler2(void* event_handler_arg, esp_event_base_t event_base, int32_t event_id, void* event_data)
+{
+    switch(event_id)
+    {
+        case OP_REQ_DEVLIST:{
+            int to_write = 0;
+            // 0xC + i*0x138 + m_(i-1)*4
+            if(devlist_data.request.version == 0) /*!< assume there is no device connected yet */
+            {
+                to_write = 12;
+                devlist_data.request.version = USBIP_VERSION;
+                devlist_data.request.command = OP_REP_DEVLIST;
+                devlist_data.request.status = 0;
+                devlist_data.count = 0;
+            } else {
+                to_write = 0x0c + __bswap_32(devlist_data.count) * 0x138 + devlist_data.bNumInterfaces * 4;
+            }
+            send(_sock, (void*)&devlist_data, to_write, MSG_DONTWAIT);
+            break;
+        }
+
+        case OP_REQ_IMPORT:{
+            int to_write = sizeof(usbip_import_t);
+            send(_sock, (void*)&import_data, to_write, MSG_DONTWAIT);
+            break;
+        }
+    }
+}
 
 USBipDevice::USBipDevice()
 {
-    // device = this;
     usb_sem = xSemaphoreCreateBinary();
     usb_sem1 = xSemaphoreCreateBinary();
     xSemaphoreGive(usb_sem);
     xSemaphoreGive(usb_sem1);
 
-    esp_event_loop_args_t loop_args = {
-        .queue_size = 100,
-        .task_name = "usbip_events_task",
-        .task_priority = 21,
-        .task_stack_size = 4*1024,
-        .task_core_id = 1
-    };
-
-    esp_event_loop_create(&loop_args, &loop_handle);
-
-    esp_event_handler_register_with(loop_handle, USBIP_EVENT_BASE, ESP_EVENT_ANY_ID, _event_handler, this);
+    esp_event_handler_register_with(loop_handle, USBIP_EVENT_BASE, USB_CTRL_RESP, _event_handler, this);
+    esp_event_handler_register_with(loop_handle, USBIP_EVENT_BASE, USB_EPx_RESP, _event_handler, this);
+    esp_event_handler_register_with(loop_handle, USBIP_EVENT_BASE, USBIP_CMD_SUBMIT, _event_handler1, this);
+    esp_event_handler_register_with(loop_handle, USBIP_EVENT_BASE, USBIP_CMD_UNLINK, _event_handler1, this);
 }
 
 USBipDevice::~USBipDevice()
 {
+    esp_event_handler_unregister_with(loop_handle, USBIP_EVENT_BASE, ESP_EVENT_ANY_ID, _event_handler);
+    esp_event_handler_unregister_with(loop_handle, USBIP_EVENT_BASE, ESP_EVENT_ANY_ID, _event_handler1);
+    memset(&import_data, 0, sizeof(usbip_import_t));
+    memset(&devlist_data, 0, sizeof(usbip_devlist_t));
 }
 
 bool USBipDevice::init(USBhost* host)
@@ -307,55 +332,73 @@ bool USBipDevice::init(USBhost* host)
         ESP_LOGI("", "interface claim status: %d", err);
     }
 
+    fill_list_data();
+    fill_import_data();
     return true;
 }
 
-void USBipDevice::fill_import_data(usbip_import_t* resp)
+void USBipDevice::fill_import_data()
 {
-    resp->speed = info.speed ? 0x02000000 : 0x01000000;
-    resp->idVendor = dev_desc->idVendor;
-    resp->idProduct = dev_desc->idProduct;
-    resp->bcdDevice = dev_desc->bcdDevice;
-    resp->bDeviceClass = dev_desc->bDeviceClass;
-    resp->bDeviceSubClass = dev_desc->bDeviceSubClass;
-    resp->bDeviceProtocol = dev_desc->bDeviceProtocol;
-    resp->bConfigurationValue = config_desc->bConfigurationValue;
-    resp->bNumConfigurations = dev_desc->bNumConfigurations;
-    resp->bNumInterfaces = config_desc->bNumInterfaces;
+    memset(&import_data, 0, sizeof(usbip_import_t));
+    import_data.request.version = USBIP_VERSION;
+    import_data.request.command = OP_REP_IMPORT;
+    import_data.request.status = 0;
+    strcpy(import_data.path, "/espressif/usbip/usb1");
+    strcpy(import_data.busid, "1-1");
+    import_data.busnum = __bswap_32(1);
+    import_data.devnum = __bswap_32(1);
+
+    import_data.speed = info.speed ? __bswap_32(2) : __bswap_32(1);
+    devlist_data.idVendor = __bswap_16(dev_desc->idVendor);
+    devlist_data.idProduct = __bswap_16(dev_desc->idProduct);
+    devlist_data.bcdDevice = __bswap_16(dev_desc->bcdDevice);
+    import_data.bDeviceClass = dev_desc->bDeviceClass;
+    import_data.bDeviceSubClass = dev_desc->bDeviceSubClass;
+    import_data.bDeviceProtocol = dev_desc->bDeviceProtocol;
+    import_data.bConfigurationValue = config_desc->bConfigurationValue;
+    import_data.bNumConfigurations = dev_desc->bNumConfigurations;
+    import_data.bNumInterfaces = config_desc->bNumInterfaces;
 }
 
-void USBipDevice::fill_list_data(usbip_devlist_t* resp)
+void USBipDevice::fill_list_data()
 {
     int offset = 0;
     for (size_t n = 0; n < config_desc->bNumInterfaces; n++)
     {
         const usb_intf_desc_t *intf = usb_parse_interface_descriptor(config_desc, n, 0, &offset);
-        resp->intfs[n].bInterfaceClass = intf->bInterfaceClass,
-        resp->intfs[n].bInterfaceSubClass = intf->bInterfaceSubClass,
-        resp->intfs[n].bInterfaceProtocol = intf->bInterfaceProtocol,
-        resp->intfs[n].padding  = 0;
+        devlist_data.intfs[n].bInterfaceClass = intf->bInterfaceClass,
+        devlist_data.intfs[n].bInterfaceSubClass = intf->bInterfaceSubClass,
+        devlist_data.intfs[n].bInterfaceProtocol = intf->bInterfaceProtocol,
+        devlist_data.intfs[n].padding  = 0;
     }
-    resp->speed = info.speed ? 0x02000000 : 0x01000000;
-    resp->idVendor = dev_desc->idVendor;
-    resp->idProduct = dev_desc->idProduct;
-    resp->bcdDevice = dev_desc->bcdDevice;
-    resp->bDeviceClass = dev_desc->bDeviceClass;
-    resp->bDeviceSubClass = dev_desc->bDeviceSubClass;
-    resp->bDeviceProtocol = dev_desc->bDeviceProtocol;
-    resp->bConfigurationValue = config_desc->bConfigurationValue;
-    resp->bNumConfigurations = dev_desc->bNumConfigurations;
-    resp->bNumInterfaces = config_desc->bNumInterfaces;
+
+    devlist_data.request.version = USBIP_VERSION;
+    devlist_data.request.command = OP_REP_DEVLIST;
+    devlist_data.request.status = 0;
+    devlist_data.busnum = __bswap_32(1);
+    devlist_data.devnum = __bswap_32(1);
+    devlist_data.count = __bswap_32(1);
+    strcpy(devlist_data.path, "/espressif/usbip/usb1");
+    strcpy(devlist_data.busid, "1-1");
+
+    devlist_data.speed = info.speed ? USB_FULL_SPEED : USB_LOW_SPEED;
+    devlist_data.idVendor = __bswap_16(dev_desc->idVendor);
+    devlist_data.idProduct = __bswap_16(dev_desc->idProduct);
+    devlist_data.bcdDevice = __bswap_16(dev_desc->bcdDevice);
+    devlist_data.bDeviceClass = dev_desc->bDeviceClass;
+    devlist_data.bDeviceSubClass = dev_desc->bDeviceSubClass;
+    devlist_data.bDeviceProtocol = dev_desc->bDeviceProtocol;
+    devlist_data.bConfigurationValue = config_desc->bConfigurationValue;
+    devlist_data.bNumConfigurations = dev_desc->bNumConfigurations;
+    devlist_data.bNumInterfaces = config_desc->bNumInterfaces;
 }
 
 int USBipDevice::req_ctrl_xfer(usbip_submit_t* req)
 {
-    // ESP_LOG_BUFFER_HEX_LEVEL("ctrl ep", req, 48, ESP_LOG_ERROR);
     usb_transfer_t* _xfer_ctrl = allocate(1000);
     _xfer_ctrl->callback = usb_ctrl_cb;
     _xfer_ctrl->context = req;
     _xfer_ctrl->bEndpointAddress = __bswap_32(req->header.ep) | (__bswap_32(req->header.direction) << 7);
-    // printf("req_ep_xfer ep: %d[%d], dir: %d\n", __bswap_32(req->header.ep), _xfer_ctrl->bEndpointAddress, __bswap_32(req->header.direction));
-
 
     usb_setup_packet_t * temp = (usb_setup_packet_t *)_xfer_ctrl->data_buffer;
     size_t n = 0;
@@ -371,8 +414,6 @@ int USBipDevice::req_ctrl_xfer(usbip_submit_t* req)
     // For ISO transfers the padding between each ISO packets is not transmitted.
     _xfer_ctrl->num_bytes = sizeof(usb_setup_packet_t) + __bswap_32(req->length);
     _xfer_ctrl->bEndpointAddress = __bswap_32(req->header.ep) | (__bswap_32(req->header.direction) << 7);
-    // ESP_LOG_BUFFER_HEX("", temp->val, len - 40);
-    // printf("num_bytes_ctrl[%d/%d]: %d\n", n, _n, _xfer_ctrl->num_bytes);
     _xfer_ctrl->context = req;
     
     esp_err_t err = usb_host_transfer_submit_control(_host->clientHandle(), _xfer_ctrl);
@@ -380,8 +421,6 @@ int USBipDevice::req_ctrl_xfer(usbip_submit_t* req)
     return  n;
 }
 
-// TODO:
-int errno;
 int USBipDevice::req_ep_xfer(usbip_submit_t* req)
 {
     size_t _len = __bswap_32(req->length);
@@ -440,10 +479,10 @@ int USBipDevice::req_ep_xfer(usbip_submit_t* req)
     return n;
 }
 
+// TODO: switch it to events
 extern "C" void parse_request(const int sock, uint8_t* rx_buffer, size_t len)
 {
-    uint32_t cmd = __bswap_16(((usbip_request_t*)rx_buffer)->command);
-    // printf("cmd: 0x%04x\n", cmd);
+    uint32_t cmd = ((usbip_request_t*)rx_buffer)->command;
     _sock = sock;
 
     switch (cmd)
@@ -461,18 +500,20 @@ extern "C" void parse_request(const int sock, uint8_t* rx_buffer, size_t len)
     case USBIP_CMD_SUBMIT:{
         ESP_LOGI(TAG, "USBIP_CMD_SUBMIT");
         urb_data_t data = {
+             .socket = sock,
              .len = (int)len,
              .rx_buffer = rx_buffer
         };
+        usbip_submit_t* _req = (usbip_submit_t*)(rx_buffer);
         esp_event_post_to(loop_handle, USBIP_EVENT_BASE, USBIP_CMD_SUBMIT, &data, len + sizeof(int), 10);
-        if(xSemaphoreTake(usb_sem, 10000) != pdTRUE) printf("faileeeed\n\n\n");
-        xSemaphoreGive(usb_sem);
         break;
     }
     case USBIP_CMD_UNLINK:{
         ESP_LOGI(TAG, "USBIP_CMD_UNLINK");
         usbip_submit_t* _req = (usbip_submit_t*)(rx_buffer);
         usbip_submit_t* req = new usbip_submit_t(); // make it heap caps malloc
+        last_unlink = __bswap_32(_req->flags);
+        vec.insert(vec.begin(), last_unlink);
         memcpy(req, _req, 0x30);
         esp_event_post_to(loop_handle, USBIP_EVENT_BASE, USBIP_CMD_UNLINK, &req, sizeof(usbip_submit_t*), 10);
         break;
@@ -481,5 +522,23 @@ extern "C" void parse_request(const int sock, uint8_t* rx_buffer, size_t len)
         ESP_LOGE(TAG, "unknown command: %" PRIu32, cmd); // PRIu32
         break;
     }
-    vTaskDelay(10);
 }
+
+
+USBIP::USBIP()
+{
+    esp_event_loop_args_t loop_args = {
+        .queue_size = 100,
+        .task_name = "usbip_events",
+        .task_priority = 21,
+        .task_stack_size = 4*1024,
+        .task_core_id = 0
+    };
+
+    esp_event_loop_create(&loop_args, &loop_handle);
+
+    esp_event_handler_register_with(loop_handle, USBIP_EVENT_BASE, OP_REQ_DEVLIST, _event_handler2, NULL); /*!< handle list USB devices - `usbip list -r myIP` */
+    esp_event_handler_register_with(loop_handle, USBIP_EVENT_BASE, OP_REQ_IMPORT, _event_handler2, NULL);
+}
+
+USBIP::~USBIP() {}
